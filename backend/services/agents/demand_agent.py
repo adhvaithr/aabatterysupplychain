@@ -219,7 +219,7 @@ class DemandAgent:
 
         events: list[dict[str, Any]] = []
         for sku_id, sku_all in merged.groupby("sku_id", sort=False):
-            metrics_by_dc = {row.dc: row for row in sku_all.itertuples(index=False)}
+            metrics_by_dc = {dc: grp.iloc[0] for dc, grp in sku_all.groupby("dc")}
             sku_eligible = eligible[eligible["sku_id"] == sku_id]
             for row in sku_eligible.itertuples(index=False):
                 source_dc = row.dc

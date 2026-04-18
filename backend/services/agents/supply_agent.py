@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Iterable, Protocol
 
+import pandas as pd
+
 
 @dataclass(frozen=True)
 class SupplyEventInput:
@@ -16,6 +18,8 @@ class SupplyEventInput:
     as_of_date: date | None = None
 
     def resolve_stockout_date(self, today: date) -> date | None:
+        if self.stockout_date is not None and pd.isna(self.stockout_date):
+            return None
         if self.stockout_date is not None:
             return self.stockout_date
         if self.days_of_supply is None:

@@ -110,7 +110,7 @@ class PenaltyAgent:
             return raw.date()
         return pd.to_datetime(raw).date()
 
-    def _load_events(self) -> pd.DataFrame:
+    def _load_events(self, event_ids: list[int] | None = None) -> pd.DataFrame:
         rows = _fetch_all_rows(
             self.client,
             "events",
@@ -120,9 +120,45 @@ class PenaltyAgent:
         df = pd.DataFrame(rows)
         if df.empty:
             return df
+        if event_ids is not None:
+            wanted_ids = {int(event_id) for event_id in event_ids}
+            df = df[df["id"].isin(wanted_ids)].copy()
+            print(
+                f"penalty_agent: narrowed event set to {len(df)} rows using {len(wanted_ids)} requested event ids."
+            )
+            if df.empty:
+                return df
         df["sku_id"] = df["sku_id"].astype("string").str.strip()
         df["source_dc"] = df["source_dc"].astype("string").str.strip()
         return df[df["sku_id"].notna() & df["source_dc"].isin(ALL_DCS)].copy()
+
+    @staticmethod
+    def _risk_score_from_indexes(
+        *,
+        channel_penalty_index: float,
+        customer_penalty_index: float,
+        dc_penalty_index: float,
+        penalty_type_index: float,
+        expected_penalty_cost: float,
+        global_penalty_avg: float,
+    ) -> float:
+        baseline = max(float(global_penalty_avg), 1.0)
+        blended_exposure = (
+            float(channel_penalty_index)
+            + float(customer_penalty_index)
+            + float(dc_penalty_index)
+            + float(penalty_type_index)
+            + float(expected_penalty_cost)
+        ) / 5.0
+        return round(min(max(blended_exposure / (baseline * 2.0), 0.0), 1.0), 4)
+
+    @staticmethod
+    def _risk_level_from_score(score: float) -> str:
+        if score >= 0.67:
+            return "HIGH"
+        if score >= 0.34:
+            return "MEDIUM"
+        return "LOW"
 
     def _load_customer_dc_mapping(self) -> pd.DataFrame:
         rows = _fetch_all_rows(
@@ -250,8 +286,8 @@ class PenaltyAgent:
 
         return float(global_fallback)
 
-    def build_event_penalty_payloads(self) -> pd.DataFrame:
-        events = self._load_events()
+    def build_event_penalty_payloads(self, event_ids: list[int] | None = None) -> pd.DataFrame:
+        events = self._load_events(event_ids=event_ids)
         if events.empty:
             return pd.DataFrame()
 
@@ -313,6 +349,15 @@ class PenaltyAgent:
                 source_dc=source_dc,
                 global_fallback=global_penalty_avg,
             )
+            penalty_risk_score = self._risk_score_from_indexes(
+                channel_penalty_index=channel_penalty_index,
+                customer_penalty_index=customer_penalty_index,
+                dc_penalty_index=dc_penalty_index,
+                penalty_type_index=penalty_type_index,
+                expected_penalty_cost=expected_penalty_cost,
+                global_penalty_avg=global_penalty_avg,
+            )
+            penalty_risk_level = self._risk_level_from_score(penalty_risk_score)
 
             payloads.append(
                 {
@@ -324,6 +369,8 @@ class PenaltyAgent:
                     "customer_penalty_index": round(customer_penalty_index, 2),
                     "dc_penalty_index": round(dc_penalty_index, 2),
                     "penalty_type_index": round(penalty_type_index, 2),
+                    "penalty_risk_score": penalty_risk_score,
+                    "penalty_risk_level": penalty_risk_level,
                     "expected_penalty_cost": round(expected_penalty_cost, 2),
                 }
             )
@@ -338,10 +385,20 @@ class PenaltyAgent:
             print("penalty_agent: no event payloads to persist.")
             return
         for row in payload_df.itertuples(index=False):
-            print(f"penalty_agent: updating event {row.event_id} expected_penalty_cost={row.expected_penalty_cost}")
+            print(
+                "penalty_agent: updating "
+                f"event {row.event_id} expected_penalty_cost={row.expected_penalty_cost} "
+                f"penalty_risk_score={row.penalty_risk_score} penalty_risk_level={row.penalty_risk_level}"
+            )
             (
                 self.client.table("events")
-                .update({"expected_penalty_cost": float(row.expected_penalty_cost)})
+                .update(
+                    {
+                        "expected_penalty_cost": float(row.expected_penalty_cost),
+                        "penalty_risk_score": float(row.penalty_risk_score),
+                        "penalty_risk_level": str(row.penalty_risk_level),
+                    }
+                )
                 .eq("id", int(row.event_id))
                 .execute()
             )
