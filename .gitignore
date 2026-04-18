@@ -2,3 +2,5 @@ venv/
 .env
 backend/data
 __pycache__/
+.next/
+node_modules/
