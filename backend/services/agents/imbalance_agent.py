@@ -32,6 +32,8 @@ def _create_client() -> Client:
 def _parse_date(value: Any) -> date | None:
     if value is None:
         return None
+    if pd.isna(value):
+        return None
     if isinstance(value, date):
         return value
     if isinstance(value, datetime):
@@ -39,6 +41,12 @@ def _parse_date(value: Any) -> date | None:
     if isinstance(value, str) and value:
         return datetime.fromisoformat(value).date()
     return None
+
+
+def _date_to_iso(value: date | None) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return value.isoformat()
 
 
 def _to_float(value: Any) -> float | None:
@@ -51,6 +59,12 @@ def _to_float(value: Any) -> float | None:
     if pd.isna(parsed):
         return None
     return parsed
+
+
+def _normalize_projection(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return value
+    return []
 
 
 @dataclass
@@ -109,7 +123,16 @@ class ImbalanceAgent:
 
     def _normalize_low_stock_hits(self, demand_df: pd.DataFrame, as_of_date: date) -> pd.DataFrame:
         if demand_df.empty:
-            return pd.DataFrame(columns=["sku_id", "dest_dc", "days_of_supply", "stockout_date", "as_of_date"])
+            return pd.DataFrame(
+                columns=[
+                    "sku_id",
+                    "dest_dc",
+                    "days_of_supply",
+                    "stockout_date",
+                    "as_of_date",
+                    "depletion_projection",
+                ]
+            )
 
         df = demand_df.copy()
         df["sku_id"] = df["sku_id"].astype("string").str.strip()
@@ -130,11 +153,27 @@ class ImbalanceAgent:
             df["stockout_date"] = pd.to_datetime(df["stockout_date"], errors="coerce").dt.date
         else:
             df["stockout_date"] = pd.NaT
+        if "depletion_projection" not in df.columns:
+            df["depletion_projection"] = [[] for _ in range(len(df))]
+        else:
+            df["depletion_projection"] = df["depletion_projection"].map(_normalize_projection)
         df["as_of_date"] = as_of_date
 
-        return df[["sku_id", "dest_dc", "days_of_supply", "stockout_date", "as_of_date"]].dropna(
-            subset=["sku_id", "dest_dc", "days_of_supply"]
+        normalized = df[
+            [
+                "sku_id",
+                "dest_dc",
+                "days_of_supply",
+                "stockout_date",
+                "as_of_date",
+                "depletion_projection",
+            ]
+        ].dropna(subset=["sku_id", "dest_dc", "days_of_supply"])
+        print(
+            "imbalance_agent: normalized "
+            f"{len(normalized)} low-stock hits from {len(df)} demand rows for snapshot {as_of_date.isoformat()}."
         )
+        return normalized
 
     def _choose_source_dc(self, sku_inventory: pd.DataFrame, dest_dc: str) -> tuple[str | None, int, int]:
         others = sku_inventory[sku_inventory["dc"] != dest_dc].copy()
@@ -160,7 +199,13 @@ class ImbalanceAgent:
         as_of_date = self._latest_snapshot_date()
         inventory_df = self._load_inventory(as_of_date)
         if inventory_df.empty:
+            print("imbalance_agent: inventory snapshot is empty; no imbalance events can be built.")
             return pd.DataFrame()
+        print(
+            "imbalance_agent: loaded "
+            f"{len(inventory_df)} inventory rows across {inventory_df['sku_id'].nunique()} SKUs "
+            f"for snapshot {as_of_date.isoformat()}."
+        )
 
         if demand_hits_df is None:
             demand_agent = DemandAgent(
@@ -175,13 +220,25 @@ class ImbalanceAgent:
 
         low_stock_hits = self._normalize_low_stock_hits(demand_hits_df, as_of_date)
         if low_stock_hits.empty:
+            print("imbalance_agent: no normalized low-stock hits to evaluate.")
             return pd.DataFrame()
 
         events: list[dict[str, Any]] = []
+        counters = {
+            "missing_inventory": 0,
+            "no_transfer_source": 0,
+            "suppressed_by_supply": 0,
+            "emitted": 0,
+        }
 
         for hit in low_stock_hits.itertuples(index=False):
             sku_inventory = inventory_df[inventory_df["sku_id"] == hit.sku_id]
             if sku_inventory.empty:
+                counters["missing_inventory"] += 1
+                print(
+                    "imbalance_agent: skip "
+                    f"sku={hit.sku_id} dest={hit.dest_dc} reason=no_inventory_rows_for_sku"
+                )
                 continue
 
             source_dc, network_total_other, transferable_qty = self._choose_source_dc(
@@ -189,6 +246,12 @@ class ImbalanceAgent:
             )
             # T4.2: require network stock at another DC and positive transferable stock.
             if source_dc is None or network_total_other <= 0 or transferable_qty <= 0:
+                counters["no_transfer_source"] += 1
+                print(
+                    "imbalance_agent: skip "
+                    f"sku={hit.sku_id} dest={hit.dest_dc} reason=no_transferable_surplus "
+                    f"network_total_other={network_total_other} transferable_qty={transferable_qty}"
+                )
                 continue
 
             event_input = SupplyEventInput(
@@ -202,10 +265,25 @@ class ImbalanceAgent:
 
             # T4.3: suppress when inbound relief arrives before stockout.
             if supply.suppress_event:
+                counters["suppressed_by_supply"] += 1
+                print(
+                    "imbalance_agent: suppress "
+                    f"sku={hit.sku_id} source={source_dc} dest={hit.dest_dc} "
+                    f"reason=timely_inbound_relief relief_eta={_date_to_iso(supply.relief_eta)} "
+                    f"stockout_date={_date_to_iso(event_input.resolve_stockout_date(as_of_date))}"
+                )
                 continue
 
             resolved_stockout_date = event_input.resolve_stockout_date(as_of_date)
             event_key = f"{hit.sku_id}|{source_dc}|{hit.dest_dc}|{as_of_date.isoformat()}|imbalance"
+            counters["emitted"] += 1
+            print(
+                "imbalance_agent: emit "
+                f"event_key={event_key} days_of_supply={round(float(hit.days_of_supply), 2)} "
+                f"transferable_qty={transferable_qty} network_total_other={network_total_other} "
+                f"relief_arriving={supply.relief_arriving} relief_eta={_date_to_iso(supply.relief_eta)} "
+                f"po_at_risk={supply.po_at_risk}"
+            )
             events.append(
                 {
                     "event_key": event_key,
@@ -215,12 +293,11 @@ class ImbalanceAgent:
                     "dest_dc": hit.dest_dc,
                     "days_of_supply": round(float(hit.days_of_supply), 2),
                     "transferable_qty": transferable_qty,
-                    "stockout_date": resolved_stockout_date.isoformat() if resolved_stockout_date else None,
+                    "stockout_date": _date_to_iso(resolved_stockout_date),
+                    "depletion_projection": _normalize_projection(hit.depletion_projection),
                     "network_total": network_total_other,
-                    "nearest_po_eta": supply.relief_eta.isoformat() if supply.relief_eta else None,
-                    # Persist to current schema field as well.
                     "relief_arriving": supply.relief_arriving,
-                    "relief_eta": supply.relief_eta.isoformat() if supply.relief_eta else None,
+                    "relief_eta": _date_to_iso(supply.relief_eta),
                     "relief_qty": supply.relief_qty,
                     "po_at_risk": supply.po_at_risk,
                     "reasoning": (
@@ -230,6 +307,13 @@ class ImbalanceAgent:
                 }
             )
 
+        print(
+            "imbalance_agent: summary "
+            f"low_stock_hits={len(low_stock_hits)} emitted={counters['emitted']} "
+            f"missing_inventory={counters['missing_inventory']} "
+            f"no_transfer_source={counters['no_transfer_source']} "
+            f"suppressed_by_supply={counters['suppressed_by_supply']}"
+        )
         return pd.DataFrame(events)
 
     def persist_events(self, events_df: pd.DataFrame) -> None:

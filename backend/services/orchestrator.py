@@ -76,7 +76,9 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import Client
+
+from services.workflow import create_supabase_client, transition_event_state
 
 load_dotenv()
 
@@ -84,26 +86,39 @@ OPENROUTER_CHAT_COMPLETIONS_URL = f"{OPENROUTER_BASE_URL}/chat/completions"
 
 
 def _create_client() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    return create_supabase_client()
+
+
+def _clean_env_text(value: Any, *, fallback: str | None = None) -> str | None:
+    if value is None:
+        return fallback
+    cleaned = str(value).strip().strip("\"'“”‘’")
+    return cleaned or fallback
 
 
 def _openrouter_api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY")
+    key = _clean_env_text(os.environ.get("OPENROUTER_API_KEY"))
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY is not set.")
     return key
 
 
 def _openrouter_model() -> str:
-    return os.environ.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_CLAUDE_MODEL)
+    return _clean_env_text(
+        os.environ.get("OPENROUTER_MODEL"), fallback=DEFAULT_OPENROUTER_CLAUDE_MODEL
+    ) or DEFAULT_OPENROUTER_CLAUDE_MODEL
 
 
 def _openrouter_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {_openrouter_api_key()}",
         "Content-Type": "application/json",
-        "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://localhost"),
-        "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "POP Supply Chain"),
+        "HTTP-Referer": _clean_env_text(
+            os.environ.get("OPENROUTER_HTTP_REFERER"), fallback="http://localhost"
+        )
+        or "http://localhost",
+        "X-Title": _clean_env_text(os.environ.get("OPENROUTER_APP_TITLE"), fallback="POP Supply Chain")
+        or "POP Supply Chain",
     }
 
 
@@ -240,6 +255,22 @@ def _map_action_to_db(action: str) -> str:
     return "MONITOR"
 
 
+def _fallback_reasoning(event: dict[str, Any], exc: Exception) -> str:
+    base_reasoning = str(event.get("reasoning") or "").strip()
+    failure_detail = str(exc).strip() or "AI provider unavailable."
+    detail = failure_detail.splitlines()[0][:240]
+    if base_reasoning:
+        return (
+            "Automated recommendation is currently unavailable, so this event remains in DETECTED state. "
+            f"Base event context: {base_reasoning} "
+            f"Analysis failure: {detail}. Retry analysis later."
+        )
+    return (
+        "Automated recommendation is currently unavailable, so this event remains in DETECTED state. "
+        f"Analysis failure: {detail}. Retry analysis later."
+    )
+
+
 def call_claude_analyze(payload: dict[str, Any]) -> dict[str, Any]:
     """Call Claude through OpenRouter using HTTP (requests); return parsed JSON dict."""
     user_content = json.dumps(payload, separators=(",", ":"))
@@ -272,7 +303,7 @@ def call_claude_analyze(payload: dict[str, Any]) -> dict[str, Any]:
     return _parse_claude_json(str(text))
 
 
-def analyze_event(event_id: int, *, client: Client | None = None) -> dict[str, Any]:
+def analyze_event(event_id: int, *, client: Client | None = None, actor: str = "system") -> dict[str, Any]:
     """
     T8.2 — Load event, build payload, call Claude via OpenRouter (requests), apply T8.3, update event to ACTION_PROPOSED.
     On API failure (T8.4): set ai_unavailable, message in reasoning, do not advance state.
@@ -285,21 +316,33 @@ def analyze_event(event_id: int, *, client: Client | None = None) -> dict[str, A
     dest_dc = str(event.get("dest_dc") or "")
     transfer_cost = fetch_transfer_cost_avg(own_client, dest_dc)
     payload = build_analysis_request_payload(event, transfer_cost_usd=transfer_cost)
+    print(
+        "orchestrator: analyzing "
+        f"event_id={event_id} sku={event.get('sku_id')} route={event.get('source_dc')}->{dest_dc} "
+        f"transfer_cost={transfer_cost} expected_penalty_cost={event.get('expected_penalty_cost')}"
+    )
 
     try:
         parsed = call_claude_analyze(payload)
     except Exception as exc:
         # T8.4 fallback
+        fallback_reasoning = _fallback_reasoning(event, exc)
+        fallback_wait_cost = _num_or_none(event.get("expected_penalty_cost")) or 0.0
+        print(f"orchestrator: AI analysis failed for event_id={event_id}: {exc}")
         own_client.table("events").update(
             {
                 "ai_unavailable": True,
-                "reasoning": "Try again later.",
+                "recommended_action": "MONITOR",
+                "confidence": "LOW",
+                "reasoning": fallback_reasoning,
+                "cost_transfer": float(transfer_cost),
+                "cost_wait": float(fallback_wait_cost),
             }
         ).eq("id", event_id).execute()
         return {
             "ok": False,
             "error": "openrouter_unavailable",
-            "message": "Try again later.",
+            "message": fallback_reasoning,
             "detail": str(exc),
         }
 
@@ -310,21 +353,31 @@ def analyze_event(event_id: int, *, client: Client | None = None) -> dict[str, A
     reasoning = str(parsed.get("reasoning") or "").strip()
     confidence_db = apply_cost_proximity_confidence_override(cost_transfer, cost_wait, confidence_db)
 
-    own_client.table("events").update(
-        {
-            "state": "ACTION_PROPOSED",
+    updated_event = transition_event_state(
+        own_client,
+        event=event,
+        new_state="ACTION_PROPOSED",
+        actor=actor,
+        notes="Claude orchestrator recommendation generated.",
+        updates={
             "recommended_action": action,
             "confidence": confidence_db,
             "reasoning": reasoning,
             "cost_transfer": cost_transfer,
             "cost_wait": cost_wait,
             "ai_unavailable": False,
-        }
-    ).eq("id", event_id).execute()
+        },
+    )
+    print(
+        "orchestrator: analysis succeeded "
+        f"event_id={event_id} action={action} confidence={confidence_db} "
+        f"cost_transfer={cost_transfer} cost_wait={cost_wait}"
+    )
 
     return {
         "ok": True,
         "event_id": event_id,
+        "state": updated_event.get("state"),
         "recommended_action": action,
         "confidence": confidence_db,
         "reasoning": reasoning,
