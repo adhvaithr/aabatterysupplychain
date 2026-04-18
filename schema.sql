@@ -159,6 +159,7 @@ create table chargebacks (
   cause_code          cause_code,
   cause_code_desc     varchar(100),
   item_description    varchar(200),
+  penalty_category    varchar(50),
   extended_price      numeric(12,2),
   created_at          timestamptz not null default now()
 );
@@ -492,6 +493,9 @@ create index idx_chargebacks_cause_code
 
 create index idx_chargebacks_customer
   on chargebacks (customer_number);
+
+create index idx_chargebacks_penalty_category
+  on chargebacks (penalty_category);
 
 create index idx_events_state
   on events (state);

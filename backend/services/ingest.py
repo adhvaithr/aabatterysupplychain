@@ -1,9 +1,12 @@
 import argparse
 import hashlib
+import json
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -31,6 +34,19 @@ TRANSFER_ACCOUNT_TO_DC = {
     "LA - COGS - Transfer": "LA",
 }
 CHARGEBACK_CAUSE_CODES = {"CRED11-F", "CRED11-O", "CRED08", "CRED12"}
+PENALTY_CATEGORIES = (
+    "LATE_DELIVERY",
+    "EARLY_DELIVERY",
+    "SHORT_SHIP",
+    "DAMAGED_GOODS",
+    "LABELING_ERROR",
+    "OTHER",
+)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_CLAUDE_MODEL = os.environ.get(
+    "OPENROUTER_CLAUDE_MODEL", "anthropic/claude-sonnet-4"
+)
+OPENROUTER_CLASSIFICATION_CHUNK_SIZE = 150
 HASH_KEYED_TABLES = {
     "sales_history",
     "po_history",
@@ -49,6 +65,10 @@ ALL_TARGETS = [
     "lead_time_lookup",
     "customer_dc_mapping",
 ]
+
+
+def _log(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 
 def _strip_text(series: pd.Series) -> pd.Series:
@@ -125,6 +145,165 @@ def _create_client():
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 
+def _extract_json_object(raw_text: str) -> str:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if "\n" in text:
+            text = text.split("\n", 1)[1]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("Claude response did not contain a JSON object.")
+    return text[start : end + 1]
+
+
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _openrouter_message_text(body: dict) -> str:
+    choices = body.get("choices") or []
+    message = choices[0].get("message", {}) if choices else {}
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part)
+            for part in content
+        ).strip()
+    return str(content).strip()
+
+
+def _call_openrouter_for_penalty_chunk(
+    descriptions: list[str],
+    *,
+    api_key: str,
+    chunk_index: int,
+    total_chunks: int,
+) -> dict[str, str]:
+    prompt = f"""
+You will classify chargeback penalty descriptions into categories.
+For each description, return a category from this fixed list:
+- LATE_DELIVERY
+- EARLY_DELIVERY
+- SHORT_SHIP
+- DAMAGED_GOODS
+- LABELING_ERROR
+- OTHER
+
+Respond only with a JSON object mapping each description to its category.
+
+Descriptions:
+{json.dumps(descriptions)}
+""".strip()
+
+    payload = {
+        "model": OPENROUTER_CLAUDE_MODEL,
+        "max_tokens": 12000,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Respond with exactly one valid JSON object and no markdown fences. "
+                    "Every input description must appear exactly once as a key. "
+                    "Each value must be one of: " + ", ".join(PENALTY_CATEGORIES) + "."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    request = Request(
+        OPENROUTER_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://cursor.sh",
+            "X-Title": "aabatterysupplychain-ingest",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError) as exc:
+        raise RuntimeError(f"OpenRouter request failed for chunk {chunk_index}/{total_chunks}: {exc}") from exc
+
+    if "error" in body:
+        raise RuntimeError(
+            f"OpenRouter error for chunk {chunk_index}/{total_chunks}: {body['error']}"
+        )
+
+    response_text = _openrouter_message_text(body)
+    parsed = json.loads(_extract_json_object(response_text))
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"OpenRouter response for chunk {chunk_index}/{total_chunks} was not a JSON object."
+        )
+
+    result: dict[str, str] = {}
+    invalid = 0
+    for description in descriptions:
+        category = parsed.get(description)
+        if category not in PENALTY_CATEGORIES:
+            invalid += 1
+            category = "OTHER"
+        result[description] = category
+
+    if invalid:
+        _log(
+            f"chargebacks: chunk {chunk_index}/{total_chunks} returned {invalid} missing/invalid category assignments; defaulted those to OTHER."
+        )
+
+    counts = pd.Series(result.values()).value_counts().to_dict()
+    _log(
+        f"chargebacks: chunk {chunk_index}/{total_chunks} classified {len(descriptions)} descriptions into categories {counts}."
+    )
+    return result
+
+
+def _call_claude_for_penalty_categories(descriptions: list[str]) -> dict[str, str]:
+    if not descriptions:
+        return {}
+
+    _log(f"chargebacks: classifying {len(descriptions)} unique descriptions with OpenRouter Claude.")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        _log("chargebacks: OPENROUTER_API_KEY not set; defaulting all penalty_category values to OTHER.")
+        return {description: "OTHER" for description in descriptions}
+
+    chunks = _chunked(descriptions, OPENROUTER_CLASSIFICATION_CHUNK_SIZE)
+    result: dict[str, str] = {}
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            _log(
+                f"chargebacks: sending OpenRouter classification chunk {index}/{len(chunks)} "
+                f"with {len(chunk)} descriptions."
+            )
+            result.update(
+                _call_openrouter_for_penalty_chunk(
+                    chunk,
+                    api_key=api_key,
+                    chunk_index=index,
+                    total_chunks=len(chunks),
+                )
+            )
+    except Exception as exc:
+        _log(
+            f"chargebacks: OpenRouter Claude classification failed ({exc}); defaulting missing categories to OTHER."
+        )
+        return {description: "OTHER" for description in descriptions}
+
+    return result
+
+
 def _is_duplicate_unique_constraint_error(err: APIError) -> bool:
     message = ""
     if err.args and isinstance(err.args[0], dict):
@@ -142,16 +321,21 @@ def _write_batches(
     batch_size: int = 1000,
 ) -> None:
     if not records:
-        print(f"No rows to upload for '{table_name}'.")
+        _log(f"{table_name}: no rows to upload.")
         return
 
     client = _create_client()
     on_conflict = ",".join(conflict_columns) if conflict_columns else None
     conflict_cols = on_conflict.split(",") if on_conflict else []
+    _log(
+        f"{table_name}: starting upload of {len(records)} records"
+        + (f" with upsert key ({on_conflict})" if on_conflict else " with plain inserts")
+        + f"; batch_size={batch_size}."
+    )
 
     for start in range(0, len(records), batch_size):
         batch = records[start : start + batch_size]
-        print(f"{table_name}: uploading rows {start}..{start + len(batch) - 1}")
+        _log(f"{table_name}: uploading rows {start}..{start + len(batch) - 1}")
         if on_conflict:
             key_counts: dict[tuple, int] = {}
             for record in batch:
@@ -159,7 +343,7 @@ def _write_batches(
                 key_counts[key] = key_counts.get(key, 0) + 1
             dup_keys = sum(1 for _key, count in key_counts.items() if count > 1)
             if dup_keys:
-                print(
+                _log(
                     f"{table_name}: warning: batch at offset {start} contains {dup_keys} "
                     f"duplicate upsert key(s) on ({on_conflict}); same batch may error in Postgres."
                 )
@@ -170,14 +354,14 @@ def _write_batches(
                 client.table(table_name).insert(batch).execute()
         except APIError as err:
             if on_conflict and _is_duplicate_unique_constraint_error(err):
-                print(
+                _log(
                     f"{table_name}: duplicate-key conflict while upserting batch at offset {start} "
                     f"on ({on_conflict}); treating as idempotent skip. Detail: {err}"
                 )
                 continue
             raise
 
-    print(f"Uploaded {len(records)} rows to '{table_name}'.")
+    _log(f"{table_name}: uploaded {len(records)} rows.")
 
 
 def upload_table(
@@ -194,10 +378,12 @@ def insert_table(table_name: str, df: pd.DataFrame) -> None:
 
 
 def load_inventory_snapshots(path: Path = INVENTORY_PATH) -> pd.DataFrame:
+    _log(f"inventory_snapshots: reading workbook {path.name}.")
     sheets = pd.read_excel(path, sheet_name=list(INVENTORY_SHEET_MAP.keys()), dtype=object)
     frames = []
     for sheet_name, dc_value in INVENTORY_SHEET_MAP.items():
         df = sheets[sheet_name].copy()
+        _log(f"inventory_snapshots: sheet '{sheet_name}' -> dc={dc_value}, rows={len(df)}.")
         df = df.rename(
             columns={
                 "Item Number": "sku_id",
@@ -213,14 +399,19 @@ def load_inventory_snapshots(path: Path = INVENTORY_PATH) -> pd.DataFrame:
         df["dc"] = dc_value
         df["snapshot_date"] = date.today().isoformat()
         frames.append(df[["sku_id", "description", "available", "on_hand", "dc", "snapshot_date"]])
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True)
+    _log(f"inventory_snapshots: prepared {len(out)} total rows across {len(frames)} sheets.")
+    return out
 
 
 def load_sales_history(path: Path = SALES_PATH) -> pd.DataFrame:
+    _log(f"sales_history: reading CSV {path.name}.")
     df = pd.read_csv(path, parse_dates=["DOCDATE"], dtype={"LOCNCODE": "string"}, low_memory=False)
+    _log(f"sales_history: raw rows={len(df)}.")
     df["LOCNCODE"] = _strip_text(df["LOCNCODE"])
     df["SOP TYPE"] = _strip_text(df["SOP TYPE"])
     df = df[df["LOCNCODE"].isin(LOCNCODE_TO_DC) & (df["SOP TYPE"] == "Invoice")].copy()
+    _log(f"sales_history: rows after DC + Invoice filters={len(df)}.")
 
     out = pd.DataFrame(
         {
@@ -245,11 +436,15 @@ def load_sales_history(path: Path = SALES_PATH) -> pd.DataFrame:
             "unit_price_adj": _to_nullable_float(df["Unit_Price_adj"], 4),
         }
     )
-    return _add_source_row_hash(out, dedupe_label="sales_history")
+    out = _add_source_row_hash(out, dedupe_label="sales_history")
+    _log(f"sales_history: prepared {len(out)} rows after normalization/dedupe.")
+    return out
 
 
 def _load_po_source(path: Path = PO_PATH) -> pd.DataFrame:
+    _log(f"po_history: reading workbook {path.name}.")
     df = pd.read_excel(path, dtype=object)
+    _log(f"po_history: raw rows={len(df)}.")
     out = pd.DataFrame(
         {
             "po_number": _to_nullable_int(df["PO Number"]),
@@ -271,7 +466,9 @@ def _load_po_source(path: Path = PO_PATH) -> pd.DataFrame:
             "shipping_method": _strip_text(df["Shipping Method"]),
         }
     )
-    return out[out["dc"].notna()].copy()
+    out = out[out["dc"].notna()].copy()
+    _log(f"po_history: rows after ship-to-address to dc mapping={len(out)}.")
+    return out
 
 
 def load_po_history(path: Path = PO_PATH) -> pd.DataFrame:
@@ -280,7 +477,7 @@ def load_po_history(path: Path = PO_PATH) -> pd.DataFrame:
     for column in ["po_date", "required_date", "promised_ship_date", "receipt_date"]:
         out[column] = _to_iso_date(out[column])
 
-    return _add_source_row_hash(
+    out = _add_source_row_hash(
         out[
             [
                 "po_number",
@@ -304,12 +501,21 @@ def load_po_history(path: Path = PO_PATH) -> pd.DataFrame:
         ],
         dedupe_label="po_history",
     )
+    _log(f"po_history: prepared {len(out)} rows after normalization/dedupe.")
+    return out
 
 
 def load_chargebacks(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
+    _log(f"chargebacks: reading workbook {path.name} sheet 'Data - Deductions & Cause Code'.")
     df = pd.read_excel(path, sheet_name="Data - Deductions & Cause Code", dtype=object)
+    _log(f"chargebacks: raw rows={len(df)}.")
     df["Cause Code"] = _strip_text(df["Cause Code"])
     df = df[df["Cause Code"].isin(CHARGEBACK_CAUSE_CODES)].copy()
+    _log(f"chargebacks: rows after operational cause-code filter={len(df)}.")
+    descriptions = (
+        _strip_text(df["Item Description"]).dropna().drop_duplicates().sort_values().tolist()
+    )
+    description_map = _call_claude_for_penalty_categories(descriptions)
 
     out = pd.DataFrame(
         {
@@ -325,14 +531,19 @@ def load_chargebacks(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
             "cause_code": df["Cause Code"],
             "cause_code_desc": _strip_text(df["Cause Code Desc"]),
             "item_description": _strip_text(df["Item Description"]),
+            "penalty_category": _strip_text(df["Item Description"]).map(description_map).fillna("OTHER"),
             "extended_price": _to_nullable_float(df["Extended Price"], 2),
         }
     )
-    return _add_source_row_hash(out, dedupe_label="chargebacks")
+    out = _add_source_row_hash(out, dedupe_label="chargebacks")
+    _log(f"chargebacks: prepared {len(out)} rows after classification/normalization/dedupe.")
+    return out
 
 
 def load_transfer_cost_history(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
+    _log(f"transfer_cost_history: reading workbook {path.name} sheet 'Data-Transfer Cost'.")
     df = pd.read_excel(path, sheet_name="Data-Transfer Cost", dtype=object)
+    _log(f"transfer_cost_history: raw rows={len(df)}.")
     out = pd.DataFrame(
         {
             "journal_entry": _to_nullable_int(df["Journal Entry"]),
@@ -345,11 +556,15 @@ def load_transfer_cost_history(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
             "reference": _strip_text(df["Reference"]),
         }
     )
-    return _add_source_row_hash(out, dedupe_label="transfer_cost_history")
+    out = _add_source_row_hash(out, dedupe_label="transfer_cost_history")
+    _log(f"transfer_cost_history: prepared {len(out)} rows after normalization/dedupe.")
+    return out
 
 
 def load_penalty_history(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
+    _log(f"penalty_history: reading workbook {path.name} sheet 'Data-Penalty'.")
     df = pd.read_excel(path, sheet_name="Data-Penalty", dtype=object)
+    _log(f"penalty_history: raw rows={len(df)}.")
     out = pd.DataFrame(
         {
             "salesperson_id": _strip_text(df["Salesperson ID"]),
@@ -367,10 +582,13 @@ def load_penalty_history(path: Path = CHARGEBACKS_PATH) -> pd.DataFrame:
             "market": _strip_text(df["MARKET"]),
         }
     )
-    return _add_source_row_hash(out, dedupe_label="penalty_history")
+    out = _add_source_row_hash(out, dedupe_label="penalty_history")
+    _log(f"penalty_history: prepared {len(out)} rows after normalization/dedupe.")
+    return out
 
 
 def derive_transfer_cost_lookup(history_df: pd.DataFrame) -> pd.DataFrame:
+    _log(f"transfer_cost_lookup: deriving from {len(history_df)} transfer_cost_history rows.")
     df = history_df.copy()
     df = df[df["dc"].notna() & df["amount"].notna()].copy()
     # Reversal rows can be negative; use cost magnitude for route-level lookup stats.
@@ -385,10 +603,13 @@ def derive_transfer_cost_lookup(history_df: pd.DataFrame) -> pd.DataFrame:
     for column in ["avg_cost", "min_cost", "max_cost"]:
         grouped[column] = grouped[column].round(2)
     grouped["sample_size"] = grouped["sample_size"].astype("Int64")
-    return grouped[["dest_dc", "avg_cost", "min_cost", "max_cost", "sample_size"]]
+    grouped = grouped[["dest_dc", "avg_cost", "min_cost", "max_cost", "sample_size"]]
+    _log(f"transfer_cost_lookup: prepared {len(grouped)} grouped rows.")
+    return grouped
 
 
 def derive_lead_time_lookup(path: Path = PO_PATH) -> pd.DataFrame:
+    _log("lead_time_lookup: deriving from po_history source rows.")
     df = _load_po_source(path)
     df = df[df["po_date"].notna() & df["receipt_date"].notna()].copy()
     df["lead_days"] = (df["receipt_date"] - df["po_date"]).dt.days
@@ -402,10 +623,13 @@ def derive_lead_time_lookup(path: Path = PO_PATH) -> pd.DataFrame:
     grouped["median_days"] = grouped["median_days"].round(1)
     grouped["avg_days"] = grouped["avg_days"].round(1)
     grouped["sample_size"] = grouped["sample_size"].astype("Int64")
-    return grouped[["dc", "median_days", "avg_days", "sample_size"]]
+    grouped = grouped[["dc", "median_days", "avg_days", "sample_size"]]
+    _log(f"lead_time_lookup: prepared {len(grouped)} grouped rows after lead_days filters.")
+    return grouped
 
 
 def derive_customer_dc_mapping(sales_df: pd.DataFrame) -> pd.DataFrame:
+    _log(f"customer_dc_mapping: deriving from {len(sales_df)} sales_history rows.")
     counts = (
         sales_df.groupby(["customer_number", "dc"], as_index=False)
         .size()
@@ -425,10 +649,13 @@ def derive_customer_dc_mapping(sales_df: pd.DataFrame) -> pd.DataFrame:
 
     out = winners.merge(customer_type, on="customer_number", how="left")
     out["order_count"] = out["order_count"].astype("Int64")
-    return out[["customer_number", "primary_dc", "customer_type", "order_count"]]
+    out = out[["customer_number", "primary_dc", "customer_type", "order_count"]]
+    _log(f"customer_dc_mapping: prepared {len(out)} customer mappings.")
+    return out
 
 
 def build_datasets(targets: set[str]) -> dict[str, pd.DataFrame]:
+    _log(f"build_datasets: requested targets={sorted(targets)}.")
     datasets: dict[str, pd.DataFrame] = {}
 
     if "inventory_snapshots" in targets:
@@ -491,6 +718,7 @@ def write_dataset(table_name: str, df: pd.DataFrame) -> None:
 
 def run_targets(targets: Iterable[str], *, dry_run: bool = False) -> None:
     target_set = set(targets)
+    _log(f"run_targets: starting for targets={sorted(target_set)} dry_run={dry_run}.")
     datasets = build_datasets(target_set)
 
     if "po_history" in target_set:
@@ -504,10 +732,11 @@ def run_targets(targets: Iterable[str], *, dry_run: bool = False) -> None:
         if table_name not in target_set:
             continue
         df = datasets[table_name]
-        print(f"{table_name}: prepared {len(df)} rows")
+        _log(f"{table_name}: prepared {len(df)} rows")
         if dry_run:
             continue
         write_dataset(table_name, df)
+    _log("run_targets: completed.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -530,6 +759,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     targets = ALL_TARGETS if not args.targets or "all" in args.targets else args.targets
+    _log(f"main: resolved targets={targets}.")
     run_targets(targets, dry_run=args.dry_run)
 
 
