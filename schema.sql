@@ -1,5 +1,6 @@
 -- ============================================================
--- POP Inventory Balancing System — Supabase Schema (Safe Rerun)
+-- POP Inventory Balancing System — Supabase Schema
+-- Null-safe for Excel/CSV ingest
 -- ============================================================
 
 -- ------------------------------------------------------------
@@ -67,6 +68,7 @@ create type cause_code as enum (
 
 -- ------------------------------------------------------------
 -- Layer 1: Raw ingested data
+-- Keep raw ingest permissive. Excel blanks often become NULL.
 -- ------------------------------------------------------------
 
 create table inventory_snapshots (
@@ -74,27 +76,30 @@ create table inventory_snapshots (
   sku_id          varchar(20)  not null,
   description     varchar(200),
   dc              dc_code      not null,
-  available       integer      not null default 0,
-  on_hand         integer      not null default 0,
+  available       integer,
+  on_hand         integer,
   snapshot_date   date         not null default current_date,
   created_at      timestamptz  not null default now(),
-  constraint inventory_snapshots_available_nonnegative check (available >= 0),
-  constraint inventory_snapshots_on_hand_nonnegative check (on_hand >= 0),
+  constraint inventory_snapshots_available_nonnegative
+    check (available is null or available >= 0),
+  constraint inventory_snapshots_on_hand_nonnegative
+    check (on_hand is null or on_hand >= 0),
   unique (sku_id, dc, snapshot_date)
 );
 
 create table sales_history (
   id              bigserial primary key,
-  dc              dc_code      not null,
+  source_row_hash varchar(64) not null unique,
+  dc              dc_code,
   salesperson_id  varchar(15),
-  customer_number varchar(12)  not null,
+  customer_number varchar(12),
   city            varchar(100),
-  state           varchar(2),
+  state           varchar(100),
   sop_number      varchar(20),
-  doc_date        date         not null,
-  sku_id          varchar(20)  not null,
+  doc_date        date,
+  sku_id          varchar(20),
   item_desc       varchar(200),
-  quantity_adj    integer      not null,
+  quantity_adj    integer,
   uom             varchar(10),
   qty_base_uom    integer,
   ext_price_adj   numeric(12,2),
@@ -104,18 +109,19 @@ create table sales_history (
   gross_profit    numeric(12,2),
   margin_pct      numeric(8,4),
   unit_price_adj  numeric(10,4),
-  created_at      timestamptz  not null default now()
+  created_at      timestamptz not null default now()
 );
 
 create table po_history (
   id                    bigserial primary key,
-  po_number             integer      not null,
+  source_row_hash       varchar(64) not null unique,
+  po_number             integer,
   po_date               date,
   required_date         date,
   promised_ship_date    date,
   receipt_date          date,
   pop_receipt_number    integer,
-  sku_id                varchar(20)  not null,
+  sku_id                varchar(20),
   item_description      varchar(200),
   qty_shipped           integer,
   qty_invoiced          integer,
@@ -126,20 +132,26 @@ create table po_history (
   dc                    dc_code,
   ship_to_address       varchar(50),
   shipping_method       varchar(50),
-  is_open               boolean      not null default true,
-  created_at            timestamptz  not null default now(),
-  constraint po_history_qty_shipped_nonnegative check (qty_shipped is null or qty_shipped >= 0),
-  constraint po_history_qty_invoiced_nonnegative check (qty_invoiced is null or qty_invoiced >= 0),
-  constraint po_history_unit_cost_nonnegative check (unit_cost is null or unit_cost >= 0)
+  is_open               boolean not null default true,
+  created_at            timestamptz not null default now(),
+  constraint po_history_qty_shipped_nonnegative
+    check (qty_shipped is null or qty_shipped >= 0),
+  constraint po_history_qty_invoiced_nonnegative
+    check (qty_invoiced is null or qty_invoiced >= 0),
+  constraint po_history_unit_cost_nonnegative
+    check (unit_cost is null or unit_cost >= 0),
+  constraint po_history_extended_cost_nonnegative
+    check (extended_cost is null or extended_cost >= 0)
 );
 
 create table chargebacks (
   id                  bigserial primary key,
+  source_row_hash     varchar(64) not null unique,
   location_code       smallint,
   salesperson_id      varchar(15),
   customer_number     varchar(12),
   city                varchar(100),
-  state               varchar(2),
+  state               varchar(100),
   sop_type            varchar(20),
   sop_number          varchar(20),
   customer_po_number  varchar(30),
@@ -148,11 +160,12 @@ create table chargebacks (
   cause_code_desc     varchar(100),
   item_description    varchar(200),
   extended_price      numeric(12,2),
-  created_at          timestamptz  not null default now()
+  created_at          timestamptz not null default now()
 );
 
 create table transfer_cost_history (
   id                          bigserial primary key,
+  source_row_hash             varchar(64) not null unique,
   journal_entry               integer,
   trx_date                    date,
   account_number              varchar(30),
@@ -166,6 +179,7 @@ create table transfer_cost_history (
 
 create table penalty_history (
   id                  bigserial primary key,
+  source_row_hash     varchar(64) not null unique,
   salesperson_id      varchar(15),
   customer_number     varchar(12),
   customer_name       varchar(100),
@@ -179,74 +193,96 @@ create table penalty_history (
   uom                 varchar(10),
   extended_price      numeric(12,2),
   market              varchar(20),
-  created_at          timestamptz  not null default now()
+  created_at          timestamptz not null default now()
 );
 
 -- ------------------------------------------------------------
 -- Layer 2: Derived lookup tables
+-- These can stay stricter because they are system-generated.
 -- ------------------------------------------------------------
 
 create table transfer_cost_lookup (
   id          bigserial primary key,
-  dest_dc     dc_code        not null,
-  avg_cost    numeric(10,2)  not null,
+  dest_dc     dc_code       not null,
+  avg_cost    numeric(10,2),
   min_cost    numeric(10,2),
   max_cost    numeric(10,2),
   sample_size integer,
-  updated_at  timestamptz    not null default now(),
-  constraint transfer_cost_lookup_avg_cost_nonnegative check (avg_cost >= 0),
+  updated_at  timestamptz   not null default now(),
+  constraint transfer_cost_lookup_avg_cost_nonnegative
+    check (avg_cost is null or avg_cost >= 0),
+  constraint transfer_cost_lookup_min_cost_nonnegative
+    check (min_cost is null or min_cost >= 0),
+  constraint transfer_cost_lookup_max_cost_nonnegative
+    check (max_cost is null or max_cost >= 0),
+  constraint transfer_cost_lookup_sample_size_nonnegative
+    check (sample_size is null or sample_size >= 0),
   unique (dest_dc)
 );
 
 create table lead_time_lookup (
   id            bigserial primary key,
-  dc            dc_code       not null,
-  median_days   numeric(5,1)  not null,
+  dc            dc_code      not null,
+  median_days   numeric(5,1),
   avg_days      numeric(5,1),
   sample_size   integer,
-  updated_at    timestamptz   not null default now(),
-  constraint lead_time_lookup_median_days_nonnegative check (median_days >= 0),
-  constraint lead_time_lookup_avg_days_nonnegative check (avg_days is null or avg_days >= 0),
+  updated_at    timestamptz  not null default now(),
+  constraint lead_time_lookup_median_days_nonnegative
+    check (median_days is null or median_days >= 0),
+  constraint lead_time_lookup_avg_days_nonnegative
+    check (avg_days is null or avg_days >= 0),
+  constraint lead_time_lookup_sample_size_nonnegative
+    check (sample_size is null or sample_size >= 0),
   unique (dc)
 );
 
 create table customer_dc_mapping (
   id              bigserial primary key,
-  customer_number varchar(12)  not null,
-  primary_dc      dc_code      not null,
+  customer_number varchar(12) not null,
+  primary_dc      dc_code     not null,
   customer_type   varchar(50),
   order_count     integer,
-  updated_at      timestamptz  not null default now(),
-  constraint customer_dc_mapping_order_count_nonnegative check (order_count is null or order_count >= 0),
+  updated_at      timestamptz not null default now(),
+  constraint customer_dc_mapping_order_count_nonnegative
+    check (order_count is null or order_count >= 0),
   unique (customer_number)
 );
 
 -- ------------------------------------------------------------
 -- Layer 3: Feature store
+-- System-built table: keep mostly strict, but allow imported gaps.
 -- ------------------------------------------------------------
 
 create table sku_dc_features (
   id                      bigserial primary key,
-  sku_id                  varchar(20)    not null,
-  dc                      dc_code        not null,
-  available               integer        not null default 0,
-  on_hand                 integer        not null default 0,
-  network_total           integer        not null default 0,
-  demand_30d              numeric(10,4)  not null default 0,
-  demand_90d              numeric(10,4)  not null default 0,
-  weighted_daily_demand   numeric(10,4)  not null default 0.01,
-  days_of_supply          numeric(8,2)   not null default 0,
+  sku_id                  varchar(20)   not null,
+  dc                      dc_code       not null,
+  available               integer,
+  on_hand                 integer,
+  network_total           integer,
+  demand_30d              numeric(10,4),
+  demand_90d              numeric(10,4),
+  weighted_daily_demand   numeric(10,4),
+  days_of_supply          numeric(8,2),
   stockout_date           date,
-  transferable_qty        integer        not null default 0,
+  transferable_qty        integer,
   depletion_projection    jsonb,
-  as_of_date              date           not null default current_date,
-  updated_at              timestamptz    not null default now(),
-  constraint sku_dc_features_available_nonnegative check (available >= 0),
-  constraint sku_dc_features_on_hand_nonnegative check (on_hand >= 0),
-  constraint sku_dc_features_network_total_nonnegative check (network_total >= 0),
-  constraint sku_dc_features_demand_30d_nonnegative check (demand_30d >= 0),
-  constraint sku_dc_features_demand_90d_nonnegative check (demand_90d >= 0),
-  constraint sku_dc_features_weighted_daily_demand_positive check (weighted_daily_demand > 0),
+  as_of_date              date          not null default current_date,
+  updated_at              timestamptz   not null default now(),
+  constraint sku_dc_features_available_nonnegative
+    check (available is null or available >= 0),
+  constraint sku_dc_features_on_hand_nonnegative
+    check (on_hand is null or on_hand >= 0),
+  constraint sku_dc_features_network_total_nonnegative
+    check (network_total is null or network_total >= 0),
+  constraint sku_dc_features_demand_30d_nonnegative
+    check (demand_30d is null or demand_30d >= 0),
+  constraint sku_dc_features_demand_90d_nonnegative
+    check (demand_90d is null or demand_90d >= 0),
+  constraint sku_dc_features_weighted_daily_demand_nonnegative
+    check (weighted_daily_demand is null or weighted_daily_demand >= 0),
+  constraint sku_dc_features_transferable_qty_nonnegative
+    check (transferable_qty is null or transferable_qty >= 0),
   unique (sku_id, dc)
 );
 
@@ -256,18 +292,18 @@ create table sku_dc_features (
 
 create table events (
   id                      bigserial primary key,
-  sku_id                  varchar(20)        not null,
-  source_dc               dc_code            not null,
-  dest_dc                 dc_code            not null,
-  state                   event_state        not null default 'DETECTED',
+  sku_id                  varchar(20)      not null,
+  source_dc               dc_code          not null,
+  dest_dc                 dc_code          not null,
+  state                   event_state      not null default 'DETECTED',
   days_of_supply          numeric(8,2),
   stockout_date           date,
   transferable_qty        integer,
   network_total           integer,
-  relief_arriving         boolean            default false,
+  relief_arriving         boolean          default false,
   relief_eta              date,
   relief_qty              integer,
-  po_at_risk              boolean            default false,
+  po_at_risk              boolean          default false,
   penalty_risk_level      risk_level,
   penalty_risk_score      numeric(5,4),
   expected_penalty_cost   numeric(10,2),
@@ -276,26 +312,26 @@ create table events (
   reasoning               text,
   cost_transfer           numeric(10,2),
   cost_wait               numeric(10,2),
-  ai_unavailable          boolean            default false,
+  ai_unavailable          boolean          default false,
   depletion_projection    jsonb,
-  created_at              timestamptz        not null default now(),
-  updated_at              timestamptz        not null default now(),
-  constraint events_source_dest_different check (source_dc <> dest_dc),
-  constraint events_transferable_qty_nonnegative check (transferable_qty is null or transferable_qty >= 0),
-  constraint events_network_total_nonnegative check (network_total is null or network_total >= 0),
-  constraint events_relief_qty_nonnegative check (relief_qty is null or relief_qty >= 0),
-  constraint events_penalty_risk_score_range check (
-    penalty_risk_score is null or (penalty_risk_score >= 0 and penalty_risk_score <= 1)
-  ),
-  constraint events_expected_penalty_cost_nonnegative check (
-    expected_penalty_cost is null or expected_penalty_cost >= 0
-  ),
-  constraint events_cost_transfer_nonnegative check (
-    cost_transfer is null or cost_transfer >= 0
-  ),
-  constraint events_cost_wait_nonnegative check (
-    cost_wait is null or cost_wait >= 0
-  )
+  created_at              timestamptz      not null default now(),
+  updated_at              timestamptz      not null default now(),
+  constraint events_source_dest_different
+    check (source_dc <> dest_dc),
+  constraint events_transferable_qty_nonnegative
+    check (transferable_qty is null or transferable_qty >= 0),
+  constraint events_network_total_nonnegative
+    check (network_total is null or network_total >= 0),
+  constraint events_relief_qty_nonnegative
+    check (relief_qty is null or relief_qty >= 0),
+  constraint events_penalty_risk_score_range
+    check (penalty_risk_score is null or (penalty_risk_score >= 0 and penalty_risk_score <= 1)),
+  constraint events_expected_penalty_cost_nonnegative
+    check (expected_penalty_cost is null or expected_penalty_cost >= 0),
+  constraint events_cost_transfer_nonnegative
+    check (cost_transfer is null or cost_transfer >= 0),
+  constraint events_cost_wait_nonnegative
+    check (cost_wait is null or cost_wait >= 0)
 );
 
 -- ------------------------------------------------------------
@@ -304,23 +340,24 @@ create table events (
 
 create table transfer_requests (
   id               bigserial primary key,
-  event_id         bigint         not null references events(id) on delete cascade,
-  source_dc        dc_code        not null,
-  dest_dc          dc_code        not null,
-  sku_id           varchar(20)    not null,
-  qty              integer        not null,
+  event_id         bigint       not null references events(id) on delete cascade,
+  source_dc        dc_code      not null,
+  dest_dc          dc_code      not null,
+  sku_id           varchar(20)  not null,
+  qty              integer      not null,
   estimated_cost   numeric(10,2),
-  state            event_state    not null default 'PENDING_APPROVAL',
+  state            event_state  not null default 'PENDING_APPROVAL',
   rejection_reason text,
   approved_by      varchar(100),
   approved_at      timestamptz,
-  created_at       timestamptz    not null default now(),
-  updated_at       timestamptz    not null default now(),
-  constraint transfer_requests_qty_positive check (qty > 0),
-  constraint transfer_requests_source_dest_different check (source_dc <> dest_dc),
-  constraint transfer_requests_estimated_cost_nonnegative check (
-    estimated_cost is null or estimated_cost >= 0
-  )
+  created_at       timestamptz  not null default now(),
+  updated_at       timestamptz  not null default now(),
+  constraint transfer_requests_qty_positive
+    check (qty > 0),
+  constraint transfer_requests_source_dest_different
+    check (source_dc <> dest_dc),
+  constraint transfer_requests_estimated_cost_nonnegative
+    check (estimated_cost is null or estimated_cost >= 0)
 );
 
 -- ------------------------------------------------------------
@@ -329,13 +366,13 @@ create table transfer_requests (
 
 create table audit_log (
   id            bigserial primary key,
-  entity_id     bigint        not null,
-  entity_type   varchar(30)   not null,
+  entity_id     bigint      not null,
+  entity_type   varchar(30) not null,
   old_state     event_state,
-  new_state     event_state   not null,
+  new_state     event_state not null,
   actor         varchar(100),
   notes         text,
-  created_at    timestamptz   not null default now()
+  created_at    timestamptz not null default now()
 );
 
 -- ------------------------------------------------------------
