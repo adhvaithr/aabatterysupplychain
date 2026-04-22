@@ -173,8 +173,13 @@ class SupplyAgent:
 
     def _load_open_pos(self, sku_id: str, dest_dc: str, today: date) -> pd.DataFrame:
         """
-        Pull open POs for a specific SKU + DC.
-        A PO is open if receipt_date is null (not yet received) or in the future.
+        Pull open POs for a specific SKU + DC using the is_open boolean flag,
+        which is maintained by the trg_po_history_set_is_open trigger. This avoids
+        the fragile .or_() filter on receipt_date that can cause infinite pagination.
+
+        Schema columns used: po_number, qty_shipped, qty_invoiced, required_date,
+                             promised_ship_date, receipt_date, is_open
+        open_qty proxy: qty_shipped - qty_invoiced (units in transit, not yet invoiced)
         """
         rows: list[dict[str, Any]] = []
         offset = 0
@@ -187,12 +192,12 @@ class SupplyAgent:
             response = (
                 self.client.table("po_history")
                 .select(
-                    "po_number,sku_id,dc,qty_ordered,qty_received,"
-                    "required_date,promised_ship_date,receipt_date,ship_to_address"
+                    "po_number,sku_id,dc,qty_shipped,qty_invoiced,"
+                    "required_date,promised_ship_date,receipt_date,is_open,ship_to_address"
                 )
                 .eq("sku_id", sku_id)
                 .eq("dc", dest_dc)
-                .or_(f"receipt_date.is.null,receipt_date.gt.{today.isoformat()}")
+                .eq("is_open", True)
                 .range(offset, offset + self.config.page_size - 1)
                 .execute()
             )
@@ -214,19 +219,21 @@ class SupplyAgent:
         df = pd.DataFrame(rows)
         df["sku_id"] = df["sku_id"].astype("string").str.strip()
         df["dc"] = df["dc"].astype("string").str.strip()
-        df["qty_ordered"] = pd.to_numeric(df.get("qty_ordered"), errors="coerce").fillna(0)
-        df["qty_received"] = pd.to_numeric(df.get("qty_received"), errors="coerce").fillna(0)
-        df["open_qty"] = (df["qty_ordered"] - df["qty_received"]).clip(lower=0).astype(int)
+        df["qty_shipped"] = pd.to_numeric(df["qty_shipped"], errors="coerce").fillna(0)
+        df["qty_invoiced"] = pd.to_numeric(df["qty_invoiced"], errors="coerce").fillna(0)
+        # open_qty: units shipped to DC but not yet invoiced/closed
+        df["open_qty"] = (df["qty_shipped"] - df["qty_invoiced"]).clip(lower=0).astype(int)
         df["required_date"] = df["required_date"].map(_parse_date)
         df["promised_ship_date"] = df["promised_ship_date"].map(_parse_date)
         df["receipt_date"] = df["receipt_date"].map(_parse_date)
 
-        # ETA: prefer receipt_date, fall back to promised_ship_date, then required_date
+        # ETA: promised_ship_date is the best forward-looking signal on an open PO;
+        # receipt_date is null or future on open POs so we skip it here
         df["eta"] = df.apply(
-            lambda r: r["receipt_date"] or r["promised_ship_date"] or r["required_date"],
+            lambda r: r["promised_ship_date"] or r["required_date"],
             axis=1,
         )
-        # A PO is delayed if its receipt_date is past its required_date
+        # Delayed: receipt_date exists but is past required_date
         df["delayed"] = df.apply(
             lambda r: (
                 r["required_date"] is not None
@@ -285,7 +292,7 @@ class SupplyAgent:
         today: date,
     ) -> SupplyDecision:
         """Apply T6.1 / T6.2 / T6.3 logic for one event candidate."""
-        is_delayed = bool((~pos_df.empty) and pos_df["delayed"].any())
+        is_delayed = bool((not pos_df.empty) and pos_df["delayed"].any())
         best_po = self._select_relief_po(pos_df) if not pos_df.empty else None
 
         relief_arriving = best_po is not None
@@ -342,19 +349,23 @@ class SupplyAgent:
     def build_supply_decisions(self, today: date | None = None) -> pd.DataFrame:
         """
         Load all events from Supabase, evaluate supply relief for each,
-        and return a DataFrame of SupplyDecision results.
+        and return a DataFrame with only the columns that map to the events table:
+          event_id, relief_arriving, relief_eta, relief_qty, po_at_risk
+ 
+        is_delayed, suppress_event, and selected_po_number are internal decision
+        state used during evaluation but have no corresponding column in the schema.
         """
         as_of = today or date.today()
         events_df = self._load_all_events()
         if events_df.empty:
             print("supply_agent: no events found in Supabase.")
             return pd.DataFrame()
-
+ 
         print(f"supply_agent: evaluating supply relief for {len(events_df)} events as of {as_of.isoformat()}.")
-
+ 
         decisions: list[dict[str, Any]] = []
         counters = {"suppressed": 0, "po_at_risk": 0, "no_relief": 0, "relief_ok": 0}
-
+ 
         for idx, row in enumerate(events_df.itertuples(index=False)):
             print(
                 f"supply_agent [decision] event {idx + 1}/{len(events_df)} "
@@ -373,12 +384,11 @@ class SupplyAgent:
             elapsed_ms = round((perf_counter() - t0) * 1000)
             print(
                 f"supply_agent [decision] event {idx + 1}/{len(events_df)} "
-                f"sku={row.sku_id} dc={row.dest_dc} "
-                f"suppress={decision.suppress_event} relief={decision.relief_arriving} "
-                f"po_at_risk={decision.po_at_risk} relief_eta={decision.relief_eta} "
-                f"elapsed_ms={elapsed_ms}"
+                f"sku={row.sku_id} dc={row.dest_dc} suppress={decision.suppress_event} "
+                f"relief={decision.relief_arriving} po_at_risk={decision.po_at_risk} "
+                f"relief_eta={decision.relief_eta} elapsed_ms={elapsed_ms}"
             )
-
+ 
             if decision.suppress_event:
                 counters["suppressed"] += 1
             elif decision.po_at_risk:
@@ -387,64 +397,78 @@ class SupplyAgent:
                 counters["relief_ok"] += 1
             else:
                 counters["no_relief"] += 1
-
+ 
             decisions.append({
                 "event_id": int(row.id),
-                "event_key": row.event_key,
-                "sku_id": decision.sku_id,
-                "dest_dc": decision.dest_dc,
                 "relief_arriving": decision.relief_arriving,
                 "relief_eta": decision.relief_eta.isoformat() if decision.relief_eta else None,
                 "relief_qty": decision.relief_qty,
-                "is_delayed": decision.is_delayed,
-                "suppress_event": decision.suppress_event,
                 "po_at_risk": decision.po_at_risk,
-                "selected_po_number": decision.selected_po_number,
             })
-
+ 
         print(
             f"supply_agent: complete — "
             f"suppressed={counters['suppressed']} po_at_risk={counters['po_at_risk']} "
             f"no_relief={counters['no_relief']} relief_ok={counters['relief_ok']}"
         )
         return pd.DataFrame(decisions)
+    
+    # decisions.append({
+    #             "event_id": int(row.id),
+    #             "event_key": row.event_key,
+    #             "sku_id": decision.sku_id,
+    #             "dest_dc": decision.dest_dc,
+    #             "relief_arriving": decision.relief_arriving,
+    #             "relief_eta": decision.relief_eta.isoformat() if decision.relief_eta else None,
+    #             "relief_qty": decision.relief_qty,
+    #             "is_delayed": decision.is_delayed,
+    #             "suppress_event": decision.suppress_event,
+    #             "po_at_risk": decision.po_at_risk,
+    #             "selected_po_number": decision.selected_po_number,
+    #         })
 
     # ------------------------------------------------------------------
     # Persist supply fields back onto events
     # ------------------------------------------------------------------
 
     def persist_supply_decisions(self, decisions_df: pd.DataFrame) -> None:
+        """
+        Write supply relief fields back onto existing events rows by event_id.
+        Only writes columns that exist on the events table:
+          relief_arriving, relief_eta, relief_qty, po_at_risk
+        """
         if decisions_df.empty:
             print("supply_agent: no decisions to persist.")
             return
-
-        records = [
-            {key: _normalize_record_value(value) for key, value in row.items()}
-            for row in decisions_df.to_dict(orient="records")
-        ]
-
-        batch_size = 500
-        for start in range(0, len(records), batch_size):
-            batch = records[start: start + batch_size]
-            batch_started_at = perf_counter()
+ 
+        updated = 0
+        failed = 0
+        for row in decisions_df.itertuples(index=False):
+            payload = {
+                "relief_arriving": _normalize_record_value(row.relief_arriving),
+                "relief_eta": _normalize_record_value(row.relief_eta),
+                "relief_qty": _normalize_record_value(row.relief_qty),
+                "po_at_risk": _normalize_record_value(row.po_at_risk),
+            }
             print(
-                f"supply_agent: upserting rows "
-                f"{start}..{start + len(batch) - 1} batch_size={len(batch)}"
+                f"supply_agent [persist] updating event_id={row.event_id} "
+                f"relief_arriving={payload['relief_arriving']} "
+                f"relief_eta={payload['relief_eta']} "
+                f"relief_qty={payload['relief_qty']} "
+                f"po_at_risk={payload['po_at_risk']}"
             )
             t0 = perf_counter()
-            self.client.table("supply_decisions").upsert(
-                batch,
-                on_conflict="event_key",
-            ).execute()
-            elapsed_ms = round((perf_counter() - t0) * 1000)
-            total_elapsed_ms = round((perf_counter() - batch_started_at) * 1000)
-            print(
-                f"supply_agent: batch complete "
-                f"rows {start}..{start + len(batch) - 1} "
-                f"upsert_ms={elapsed_ms} total_ms={total_elapsed_ms}"
-            )
-
-        print(f"supply_agent: persisted {len(records)} supply decision rows.")
+            try:
+                self.client.table("events").update(payload).eq("id", int(row.event_id)).execute()
+                elapsed_ms = round((perf_counter() - t0) * 1000)
+                print(f"supply_agent [persist] event_id={row.event_id} OK elapsed_ms={elapsed_ms}")
+                updated += 1
+            except Exception as exc:
+                elapsed_ms = round((perf_counter() - t0) * 1000)
+                print(f"supply_agent [persist] event_id={row.event_id} FAILED elapsed_ms={elapsed_ms} error={exc}")
+                failed += 1
+ 
+        print(f"supply_agent: persist complete updated={updated} failed={failed}")
 
 
 # ---------------------------------------------------------------------------
